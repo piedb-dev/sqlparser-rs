@@ -740,9 +740,19 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::AS)?;
         let data_type = self.parse_data_type()?;
         self.expect_token(&Token::RParen)?;
+        let collation = if self.parse_keywords(&[Keyword::COLLATE]) {
+            match self.next_token() {
+                Token::Word(w) => Some(w.value),
+                unexpected => self.expected("identifier", unexpected)?,
+            }
+        } else {
+            None
+        };
+
         Ok(Expr::Cast {
             expr: Box::new(expr),
             data_type,
+            collation,
         })
     }
 
@@ -1240,6 +1250,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::Cast {
             expr: Box::new(expr),
             data_type: self.parse_data_type()?,
+            collation: None,
         })
     }
 
@@ -2430,12 +2441,19 @@ impl<'a> Parser<'a> {
                         Ok(DataType::BigInt(optional_precision?))
                     }
                 }
-                Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?)),
+                Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?, None)),
                 Keyword::CHAR | Keyword::CHARACTER => {
-                    if self.parse_keyword(Keyword::VARYING) {
-                        Ok(DataType::Varchar(self.parse_optional_precision()?))
-                    } else {
-                        Ok(DataType::Char(self.parse_optional_precision()?))
+                    let is_var = self.parse_keyword(Keyword::VARYING);
+                    let precision = self.parse_optional_precision()?;
+                    let mut charset: Option<String> = None;
+                    // handle CAST('test' AS CHAR CHARACTER SET utf8mb4);
+                    if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
+                        let name = self.parse_identifier()?;
+                        charset = Some(name.value);
+                    }
+                    match is_var {
+                        true => Ok(DataType::Varchar(precision, charset)),
+                        _ => Ok(DataType::Char(precision, charset)),
                     }
                 }
                 Keyword::UUID => Ok(DataType::Uuid),

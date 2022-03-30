@@ -25,10 +25,10 @@ use super::value::escape_single_quote_string;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DataType {
-    /// Fixed-length character type e.g. CHAR(10)
-    Char(Option<u64>),
+    /// Fixed-length character type e.g. CHAR(10), CHAR CHARACTER set utf8mb4
+    Char(Option<u64>, Option<String>),
     /// Variable-length character type e.g. VARCHAR(10)
-    Varchar(Option<u64>),
+    Varchar(Option<u64>, Option<String>),
     /// Uuid type
     Uuid,
     /// Large character object e.g. CLOB(1000)
@@ -94,8 +94,8 @@ pub enum DataType {
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            DataType::Char(size) => format_type_with_optional_length(f, "CHAR", size, false),
-            DataType::Varchar(size) => {
+            DataType::Char(size, _) => format_type_with_optional_length(f, "CHAR", size, false),
+            DataType::Varchar(size, _) => {
                 format_type_with_optional_length(f, "CHARACTER VARYING", size, false)
             }
             DataType::Uuid => write!(f, "UUID"),
