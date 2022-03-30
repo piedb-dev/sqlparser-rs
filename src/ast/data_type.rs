@@ -28,7 +28,7 @@ pub enum DataType {
     /// Fixed-length character type e.g. CHAR(10), CHAR CHARACTER set utf8mb4
     Char(Option<u64>, Option<String>),
     /// Variable-length character type e.g. VARCHAR(10)
-    Varchar(Option<u64>, Option<String>),
+    Varchar(Option<u64>),
     /// Uuid type
     Uuid,
     /// Large character object e.g. CLOB(1000)
@@ -95,7 +95,7 @@ impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             DataType::Char(size, _) => format_type_with_optional_length(f, "CHAR", size, false),
-            DataType::Varchar(size, _) => {
+            DataType::Varchar(size) => {
                 format_type_with_optional_length(f, "CHARACTER VARYING", size, false)
             }
             DataType::Uuid => write!(f, "UUID"),

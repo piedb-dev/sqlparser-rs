@@ -2441,7 +2441,7 @@ impl<'a> Parser<'a> {
                         Ok(DataType::BigInt(optional_precision?))
                     }
                 }
-                Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?, None)),
+                Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?)),
                 Keyword::CHAR | Keyword::CHARACTER => {
                     let is_var = self.parse_keyword(Keyword::VARYING);
                     let precision = self.parse_optional_precision()?;
@@ -2452,7 +2452,7 @@ impl<'a> Parser<'a> {
                         charset = Some(name.value);
                     }
                     match is_var {
-                        true => Ok(DataType::Varchar(precision, charset)),
+                        true => Ok(DataType::Varchar(precision)),
                         _ => Ok(DataType::Char(precision, charset)),
                     }
                 }

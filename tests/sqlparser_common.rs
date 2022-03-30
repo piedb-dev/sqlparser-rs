@@ -1307,7 +1307,8 @@ fn parse_cast() {
     assert_eq!(
         &Expr::Cast {
             expr: Box::new(Expr::Identifier(Ident::new("id"))),
-            data_type: DataType::BigInt(None)
+            data_type: DataType::BigInt(None),
+            collation: None
         },
         expr_from_projection(only(&select.projection))
     );
@@ -1317,7 +1318,8 @@ fn parse_cast() {
     assert_eq!(
         &Expr::Cast {
             expr: Box::new(Expr::Identifier(Ident::new("id"))),
-            data_type: DataType::TinyInt(None)
+            data_type: DataType::TinyInt(None),
+            collation: None
         },
         expr_from_projection(only(&select.projection))
     );
