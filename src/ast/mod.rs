@@ -36,8 +36,8 @@ pub use self::ddl::{
 pub use self::operator::{BinaryOperator, UnaryOperator};
 pub use self::query::{
     Cte, Fetch, Join, JoinConstraint, JoinOperator, LateralView, LockType, Offset, OffsetRows,
-    OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator, TableAlias, TableFactor,
-    TableWithJoins, Top, Values, With,
+    OrderByExpr, Query, Select, SelectInto, SelectItem, SetExpr, SetOperator, TableAlias,
+    TableFactor, TableWithJoins, Top, Values, With,
 };
 pub use self::value::{DateTimeField, TrimWhereField, Value};
 
@@ -752,6 +752,8 @@ pub enum Statement {
         delimiter: Option<Ident>,
         /// CSV HEADER
         csv_header: bool,
+        /// If true, is a 'COPY TO' statement. If false is a 'COPY FROM'
+        to: bool,
     },
     /// UPDATE
     Update {
@@ -1146,6 +1148,7 @@ impl fmt::Display for Statement {
                 delimiter,
                 filename,
                 csv_header,
+                to,
             } => {
                 write!(f, "COPY {}", table_name)?;
                 if !columns.is_empty() {
@@ -1153,7 +1156,13 @@ impl fmt::Display for Statement {
                 }
 
                 if let Some(name) = filename {
-                    write!(f, " FROM {}", name)?;
+                    if *to {
+                        write!(f, " TO {}", name)?
+                    } else {
+                        write!(f, " FROM {}", name)?;
+                    }
+                } else if *to {
+                    write!(f, " TO stdin ")?
                 } else {
                     write!(f, " FROM stdin ")?;
                 }
@@ -1212,7 +1221,7 @@ impl fmt::Display for Statement {
                 location,
                 managed_location,
             } => {
-                write!(f, "CREATE")?;
+                write!(f, "CREATE DATABASE")?;
                 if *if_not_exists {
                     write!(f, " IF NOT EXISTS")?;
                 }

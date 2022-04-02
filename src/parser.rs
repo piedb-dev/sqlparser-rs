@@ -2256,7 +2256,12 @@ impl<'a> Parser<'a> {
     pub fn parse_copy(&mut self) -> Result<Statement, ParserError> {
         let table_name = self.parse_object_name()?;
         let columns = self.parse_parenthesized_column_list(Optional)?;
-        self.expect_keywords(&[Keyword::FROM])?;
+        let to_or_from = self.expect_one_of_keywords(&[Keyword::FROM, Keyword::TO])?;
+        let to: bool = match to_or_from {
+            Keyword::TO => true,
+            Keyword::FROM => false,
+            _ => unreachable!("something wrong while parsing copy statment :("),
+        };
         let mut filename = None;
         // check whether data has to be copied form table or std in.
         if !self.parse_keyword(Keyword::STDIN) {
@@ -2294,6 +2299,7 @@ impl<'a> Parser<'a> {
             filename,
             delimiter,
             csv_header,
+            to,
         })
     }
 
@@ -2916,6 +2922,21 @@ impl<'a> Parser<'a> {
 
         let projection = self.parse_comma_separated(Parser::parse_select_item)?;
 
+        let into = if self.parse_keyword(Keyword::INTO) {
+            let temporary = self
+                .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
+                .is_some();
+            let unlogged = self.parse_keyword(Keyword::UNLOGGED);
+            let name = self.parse_object_name()?;
+            Some(SelectInto {
+                temporary,
+                unlogged,
+                name,
+            })
+        } else {
+            None
+        };
+
         // Note that for keywords to be properly handled here, they need to be
         // added to `RESERVED_FOR_COLUMN_ALIAS` / `RESERVED_FOR_TABLE_ALIAS`,
         // otherwise they may be parsed as an alias as part of the `projection`
@@ -2997,6 +3018,7 @@ impl<'a> Parser<'a> {
             distinct,
             top,
             projection,
+            into,
             from,
             lateral_views,
             selection,
