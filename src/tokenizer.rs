@@ -133,6 +133,8 @@ pub enum Token {
     ExclamationMark,
     /// Double Exclamation Mark `!!` used for PostgreSQL prefix factorial operator
     DoubleExclamationMark,
+    /// Double `@@` used for mysql system variables
+    DoubleAt,
     /// AtSign `@` used for PostgreSQL abs operator
     AtSign,
     /// `|/`, a square root math operator in PostgreSQL
@@ -187,6 +189,7 @@ impl fmt::Display for Token {
             Token::Sharp => f.write_str("#"),
             Token::ExclamationMark => f.write_str("!"),
             Token::DoubleExclamationMark => f.write_str("!!"),
+            Token::DoubleAt => f.write_str("@@"),
             Token::Tilde => f.write_str("~"),
             Token::TildeAsterisk => f.write_str("~*"),
             Token::ExclamationMarkTilde => f.write_str("!~"),
@@ -601,7 +604,13 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '#' => self.consume_and_return(chars, Token::Sharp),
-                '@' => self.consume_and_return(chars, Token::AtSign),
+                '@' => {
+                    chars.next(); // consume
+                    match chars.peek() {
+                        Some('@') => self.consume_and_return(chars, Token::DoubleAt),
+                        _ => Ok(Some(Token::AtSign)),
+                    }
+                }
                 '?' => self.consume_and_return(chars, Token::Placeholder(String::from("?"))),
                 '$' => {
                     chars.next();
