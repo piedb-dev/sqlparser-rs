@@ -2638,6 +2638,9 @@ impl<'a> Parser<'a> {
                 Token::Word(w) => {
                     idents.push(w.to_ident());
                 }
+                Token::SingleQuotedString(s) => {
+                    idents.push(Ident::with_quote('\'', s));
+                }
                 Token::EOF => break,
                 _ => {}
             }
