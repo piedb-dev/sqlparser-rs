@@ -864,6 +864,15 @@ pub enum Statement {
         obj_type: ShowCreateObject,
         obj_name: ObjectName,
     },
+    /// SHOW Tables
+    ///
+    /// Note: this is a MySQL-specific statement.
+    ShowTables {
+        extended: bool,
+        full: bool,
+        db_name: ObjectName,
+        filter: Option<ShowStatementFilter>,
+    },
     /// SHOW COLUMNS
     ///
     /// Note: this is a MySQL-specific statement.
@@ -1496,6 +1505,24 @@ impl fmt::Display for Statement {
                     obj_type = obj_type,
                     obj_name = obj_name,
                 )?;
+                Ok(())
+            }
+            Statement::ShowTables {
+                extended,
+                full,
+                db_name,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "SHOW {extended}{full}TABLES FROM {db_name}",
+                    extended = if *extended { "EXTENDED " } else { "" },
+                    full = if *full { "FULL " } else { "" },
+                    db_name = db_name,
+                )?;
+                if let Some(filter) = filter {
+                    write!(f, " {}", filter)?;
+                }
                 Ok(())
             }
             Statement::ShowColumns {
