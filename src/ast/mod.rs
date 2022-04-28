@@ -279,6 +279,7 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         data_type: DataType,
+        collation: Option<String>,
     },
     /// TRY_CAST an expression to a different data type e.g. `TRY_CAST(foo AS VARCHAR(123))`
     //  this differs from CAST in the choice of how to implement invalid conversions
@@ -440,7 +441,9 @@ impl fmt::Display for Expr {
                     write!(f, "{} {}", op, expr)
                 }
             }
-            Expr::Cast { expr, data_type } => write!(f, "CAST({} AS {})", expr, data_type),
+            Expr::Cast {
+                expr, data_type, ..
+            } => write!(f, "CAST({} AS {})", expr, data_type),
             Expr::TryCast { expr, data_type } => write!(f, "TRY_CAST({} AS {})", expr, data_type),
             Expr::Extract { field, expr } => write!(f, "EXTRACT({} FROM {})", field, expr),
             Expr::Position { expr, r#in } => write!(f, "POSITION({} IN {})", expr, r#in),
@@ -926,6 +929,15 @@ pub enum Statement {
     ShowCreate {
         obj_type: ShowCreateObject,
         obj_name: ObjectName,
+    },
+    /// SHOW Tables
+    ///
+    /// Note: this is a MySQL-specific statement.
+    ShowTables {
+        extended: bool,
+        full: bool,
+        db_name: ObjectName,
+        filter: Option<ShowStatementFilter>,
     },
     /// SHOW COLUMNS
     ///
@@ -1589,6 +1601,24 @@ impl fmt::Display for Statement {
                     obj_type = obj_type,
                     obj_name = obj_name,
                 )?;
+                Ok(())
+            }
+            Statement::ShowTables {
+                extended,
+                full,
+                db_name,
+                filter,
+            } => {
+                write!(
+                    f,
+                    "SHOW {extended}{full}TABLES FROM {db_name}",
+                    extended = if *extended { "EXTENDED " } else { "" },
+                    full = if *full { "FULL " } else { "" },
+                    db_name = db_name,
+                )?;
+                if let Some(filter) = filter {
+                    write!(f, " {}", filter)?;
+                }
                 Ok(())
             }
             Statement::ShowColumns {

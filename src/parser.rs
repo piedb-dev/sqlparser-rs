@@ -475,6 +475,16 @@ impl<'a> Parser<'a> {
                     expr: Box::new(self.parse_subexpr(Self::PLUS_MINUS_PREC)?),
                 })
             }
+            tok @ Token::DoubleAt if dialect_of!(self is MySqlDialect) => {
+                let op = match tok {
+                    Token::DoubleAt => UnaryOperator::DoubleAt,
+                    _ => unreachable!(),
+                };
+                Ok(Expr::UnaryOp {
+                    op,
+                    expr: Box::new(self.parse_subexpr(Self::PLUS_MINUS_PREC)?),
+                })
+            }
             tok @ Token::DoubleExclamationMark
             | tok @ Token::PGSquareRoot
             | tok @ Token::PGCubeRoot
@@ -741,9 +751,19 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::AS)?;
         let data_type = self.parse_data_type()?;
         self.expect_token(&Token::RParen)?;
+        let collation = if self.parse_keywords(&[Keyword::COLLATE]) {
+            match self.next_token() {
+                Token::Word(w) => Some(w.value),
+                unexpected => self.expected("identifier", unexpected)?,
+            }
+        } else {
+            None
+        };
+
         Ok(Expr::Cast {
             expr: Box::new(expr),
             data_type,
+            collation,
         })
     }
 
@@ -1276,6 +1296,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::Cast {
             expr: Box::new(expr),
             data_type: self.parse_data_type()?,
+            collation: None,
         })
     }
 
@@ -2621,10 +2642,17 @@ impl<'a> Parser<'a> {
                 Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?)),
                 Keyword::NVARCHAR => Ok(DataType::Nvarchar(self.parse_optional_precision()?)),
                 Keyword::CHAR | Keyword::CHARACTER => {
-                    if self.parse_keyword(Keyword::VARYING) {
-                        Ok(DataType::Varchar(self.parse_optional_precision()?))
-                    } else {
-                        Ok(DataType::Char(self.parse_optional_precision()?))
+                    let is_var = self.parse_keyword(Keyword::VARYING);
+                    let precision = self.parse_optional_precision()?;
+                    let mut charset: Option<String> = None;
+                    // handle CAST('test' AS CHAR CHARACTER SET utf8mb4);
+                    if self.parse_keywords(&[Keyword::CHARACTER, Keyword::SET]) {
+                        let name = self.parse_identifier()?;
+                        charset = Some(name.value);
+                    }
+                    match is_var {
+                        true => Ok(DataType::Varchar(precision)),
+                        _ => Ok(DataType::Char(precision, charset)),
                     }
                 }
                 Keyword::UUID => Ok(DataType::Uuid),
@@ -2790,6 +2818,9 @@ impl<'a> Parser<'a> {
             match self.next_token() {
                 Token::Word(w) => {
                     idents.push(w.to_ident());
+                }
+                Token::SingleQuotedString(s) => {
+                    idents.push(Ident::with_quote('\'', s));
                 }
                 Token::EOF => break,
                 _ => {}
@@ -3296,19 +3327,34 @@ impl<'a> Parser<'a> {
     pub fn parse_show_columns(&mut self) -> Result<Statement, ParserError> {
         let extended = self.parse_keyword(Keyword::EXTENDED);
         let full = self.parse_keyword(Keyword::FULL);
-        self.expect_one_of_keywords(&[Keyword::COLUMNS, Keyword::FIELDS])?;
-        self.expect_one_of_keywords(&[Keyword::FROM, Keyword::IN])?;
-        let table_name = self.parse_object_name()?;
-        // MySQL also supports FROM <database> here. In other words, MySQL
-        // allows both FROM <table> FROM <database> and FROM <database>.<table>,
-        // while we only support the latter for now.
-        let filter = self.parse_show_statement_filter()?;
-        Ok(Statement::ShowColumns {
-            extended,
-            full,
-            table_name,
-            filter,
-        })
+        if self.parse_keyword(Keyword::TABLES) {
+            self.expect_one_of_keywords(&[Keyword::FROM, Keyword::IN])?;
+            let db_name = self.parse_object_name()?;
+            // MySQL also supports FROM <database> here. In other words, MySQL
+            // allows both FROM <table> FROM <database> and FROM <database>.<table>,
+            // while we only support the latter for now.
+            let filter = self.parse_show_statement_filter()?;
+            Ok(Statement::ShowTables {
+                extended,
+                full,
+                db_name,
+                filter,
+            })
+        } else {
+            self.expect_one_of_keywords(&[Keyword::COLUMNS, Keyword::FIELDS])?;
+            self.expect_one_of_keywords(&[Keyword::FROM, Keyword::IN])?;
+            let table_name = self.parse_object_name()?;
+            // MySQL also supports FROM <database> here. In other words, MySQL
+            // allows both FROM <table> FROM <database> and FROM <database>.<table>,
+            // while we only support the latter for now.
+            let filter = self.parse_show_statement_filter()?;
+            Ok(Statement::ShowColumns {
+                extended,
+                full,
+                table_name,
+                filter,
+            })
+        }
     }
 
     pub fn parse_show_statement_filter(
