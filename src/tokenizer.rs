@@ -625,7 +625,7 @@ impl<'a> Tokenizer<'a> {
                         _ => Ok(Some(Token::Tilde)),
                     }
                 }
-               '#' => {
+                '#' => {
                     chars.next();
                     match chars.peek() {
                         Some('>') => {
