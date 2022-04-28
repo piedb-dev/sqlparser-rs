@@ -1384,7 +1384,8 @@ fn parse_cast() {
     assert_eq!(
         &Expr::Cast {
             expr: Box::new(Expr::Identifier(Ident::new("id"))),
-            data_type: DataType::Nvarchar(Some(50))
+            data_type: DataType::Nvarchar(Some(50)),
+            collation: None,
         },
         expr_from_projection(only(&select.projection))
     );
