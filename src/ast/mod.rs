@@ -180,6 +180,39 @@ impl fmt::Display for Array {
     }
 }
 
+/// JsonOperator
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum JsonOperator {
+    /// -> keeps the value as json
+    Arrow,
+    /// ->> keeps the value as text or int.
+    LongArrow,
+    /// #> Extracts JSON sub-object at the specified path
+    HashArrow,
+    /// #>> Extracts JSON sub-object at the specified path as text
+    HashLongArrow,
+}
+
+impl fmt::Display for JsonOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JsonOperator::Arrow => {
+                write!(f, "->")
+            }
+            JsonOperator::LongArrow => {
+                write!(f, "->>")
+            }
+            JsonOperator::HashArrow => {
+                write!(f, "#>")
+            }
+            JsonOperator::HashLongArrow => {
+                write!(f, "#>>")
+            }
+        }
+    }
+}
+
 /// An SQL expression of any type.
 ///
 /// The parser does not distinguish between expressions of different types
@@ -192,6 +225,12 @@ pub enum Expr {
     Identifier(Ident),
     /// Multi-part identifier, e.g. `table_alias.column` or `schema.table.col`
     CompoundIdentifier(Vec<Ident>),
+    /// JSON access (postgres)  eg: data->'tags'
+    JsonAccess {
+        left: Box<Expr>,
+        operator: JsonOperator,
+        right: Box<Expr>,
+    },
     /// `IS NULL` operator
     IsNull(Box<Expr>),
     /// `IS NOT NULL` operator
@@ -252,6 +291,11 @@ pub enum Expr {
     Extract {
         field: DateTimeField,
         expr: Box<Expr>,
+    },
+    /// POSITION(<expr> in <expr>)
+    Position {
+        expr: Box<Expr>,
+        r#in: Box<Expr>,
     },
     /// SUBSTRING(<expr> [FROM <expr>] [FOR <expr>])
     Substring {
@@ -402,6 +446,7 @@ impl fmt::Display for Expr {
             } => write!(f, "CAST({} AS {})", expr, data_type),
             Expr::TryCast { expr, data_type } => write!(f, "TRY_CAST({} AS {})", expr, data_type),
             Expr::Extract { field, expr } => write!(f, "EXTRACT({} FROM {})", field, expr),
+            Expr::Position { expr, r#in } => write!(f, "POSITION({} IN {})", expr, r#in),
             Expr::Collate { expr, collation } => write!(f, "{} COLLATE {}", expr, collation),
             Expr::Nested(ast) => write!(f, "({})", ast),
             Expr::Value(v) => write!(f, "{}", v),
@@ -509,6 +554,13 @@ impl fmt::Display for Expr {
             }
             Expr::Array(set) => {
                 write!(f, "{}", set)
+            }
+            Expr::JsonAccess {
+                left,
+                operator,
+                right,
+            } => {
+                write!(f, "{} {} {}", left, operator, right)
             }
         }
     }
@@ -744,16 +796,16 @@ pub enum Statement {
         table_name: ObjectName,
         /// COLUMNS
         columns: Vec<Ident>,
-        /// VALUES a vector of values to be copied
-        values: Vec<Option<String>>,
-        /// file name of the data to be copied from
-        filename: Option<Ident>,
-        /// delimiter character
-        delimiter: Option<Ident>,
-        /// CSV HEADER
-        csv_header: bool,
         /// If true, is a 'COPY TO' statement. If false is a 'COPY FROM'
         to: bool,
+        /// The source of 'COPY FROM', or the target of 'COPY TO'
+        target: CopyTarget,
+        /// WITH options (from PostgreSQL version 9.0)
+        options: Vec<CopyOption>,
+        /// WITH options (before PostgreSQL version 9.0)
+        legacy_options: Vec<CopyLegacyOption>,
+        /// VALUES a vector of values to be copied
+        values: Vec<Option<String>>,
     },
     /// UPDATE
     Update {
@@ -761,6 +813,8 @@ pub enum Statement {
         table: TableWithJoins,
         /// Column assignments
         assignments: Vec<Assignment>,
+        /// Table which provide value to be set
+        from: Option<TableWithJoins>,
         /// WHERE
         selection: Option<Expr>,
     },
@@ -786,6 +840,7 @@ pub enum Statement {
         or_replace: bool,
         temporary: bool,
         external: bool,
+        global: Option<bool>,
         if_not_exists: bool,
         /// Table name
         name: ObjectName,
@@ -804,6 +859,7 @@ pub enum Statement {
         engine: Option<String>,
         default_charset: Option<String>,
         collation: Option<String>,
+        on_commit: Option<OnCommit>,
     },
     /// SQLite's `CREATE VIRTUAL TABLE .. USING <module_name> (<module_args>)`
     CreateVirtualTable {
@@ -841,6 +897,16 @@ pub enum Statement {
         /// Hive allows you specify whether the table's stored data will be
         /// deleted along with the dropped table
         purge: bool,
+    },
+    /// SET [ SESSION | LOCAL ] ROLE role_name
+    ///
+    /// Note: this is a PostgreSQL-specific statement,
+    /// but may also compatible with other SQL.
+    SetRole {
+        local: bool,
+        // SESSION is the default if neither SESSION nor LOCAL appears.
+        session: bool,
+        role_name: Option<Ident>,
     },
     /// SET <variable>
     ///
@@ -1153,37 +1219,25 @@ impl fmt::Display for Statement {
             Statement::Copy {
                 table_name,
                 columns,
-                values,
-                delimiter,
-                filename,
-                csv_header,
                 to,
+                target,
+                options,
+                legacy_options,
+                values,
             } => {
                 write!(f, "COPY {}", table_name)?;
                 if !columns.is_empty() {
                     write!(f, " ({})", display_comma_separated(columns))?;
                 }
-
-                if let Some(name) = filename {
-                    if *to {
-                        write!(f, " TO {}", name)?
-                    } else {
-                        write!(f, " FROM {}", name)?;
-                    }
-                } else if *to {
-                    write!(f, " TO stdin ")?
-                } else {
-                    write!(f, " FROM stdin ")?;
+                write!(f, " {} {}", if *to { "TO" } else { "FROM" }, target)?;
+                if !options.is_empty() {
+                    write!(f, " ({})", display_comma_separated(options))?;
                 }
-                if let Some(delimiter) = delimiter {
-                    write!(f, " DELIMITER {}", delimiter)?;
-                }
-                if *csv_header {
-                    write!(f, " CSV HEADER")?;
+                if !legacy_options.is_empty() {
+                    write!(f, " {}", display_separated(legacy_options, " "))?;
                 }
                 if !values.is_empty() {
-                    write!(f, ";")?;
-                    writeln!(f)?;
+                    writeln!(f, ";")?;
                     let mut delim = "";
                     for v in values {
                         write!(f, "{}", delim)?;
@@ -1194,8 +1248,6 @@ impl fmt::Display for Statement {
                             write!(f, "\\N")?;
                         }
                     }
-                }
-                if filename.is_none() {
                     write!(f, "\n\\.")?;
                 }
                 Ok(())
@@ -1203,11 +1255,15 @@ impl fmt::Display for Statement {
             Statement::Update {
                 table,
                 assignments,
+                from,
                 selection,
             } => {
                 write!(f, "UPDATE {}", table)?;
                 if !assignments.is_empty() {
                     write!(f, " SET {}", display_comma_separated(assignments))?;
+                }
+                if let Some(from) = from {
+                    write!(f, " FROM {}", from)?;
                 }
                 if let Some(selection) = selection {
                     write!(f, " WHERE {}", selection)?;
@@ -1277,6 +1333,7 @@ impl fmt::Display for Statement {
                 hive_distribution,
                 hive_formats,
                 external,
+                global,
                 temporary,
                 file_format,
                 location,
@@ -1286,6 +1343,7 @@ impl fmt::Display for Statement {
                 default_charset,
                 engine,
                 collation,
+                on_commit,
             } => {
                 // We want to allow the following options
                 // Empty column list, allowed by PostgreSQL:
@@ -1296,9 +1354,18 @@ impl fmt::Display for Statement {
                 //   `CREATE TABLE t (a INT) AS SELECT a from t2`
                 write!(
                     f,
-                    "CREATE {or_replace}{external}{temporary}TABLE {if_not_exists}{name}",
+                    "CREATE {or_replace}{external}{global}{temporary}TABLE {if_not_exists}{name}",
                     or_replace = if *or_replace { "OR REPLACE " } else { "" },
                     external = if *external { "EXTERNAL " } else { "" },
+                    global = global
+                        .map(|global| {
+                            if global {
+                                "GLOBAL "
+                            } else {
+                                "LOCAL "
+                            }
+                        })
+                        .unwrap_or(""),
                     if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" },
                     temporary = if *temporary { "TEMPORARY " } else { "" },
                     name = name,
@@ -1420,6 +1487,17 @@ impl fmt::Display for Statement {
                 if let Some(collation) = collation {
                     write!(f, " COLLATE={}", collation)?;
                 }
+
+                if on_commit.is_some() {
+                    let on_commit = match on_commit {
+                        Some(OnCommit::DeleteRows) => "ON COMMIT DELETE ROWS",
+                        Some(OnCommit::PreserveRows) => "ON COMMIT PRESERVE ROWS",
+                        Some(OnCommit::Drop) => "ON COMMIT DROP",
+                        None => "",
+                    };
+                    write!(f, " {}", on_commit)?;
+                }
+
                 Ok(())
             }
             Statement::CreateVirtualTable {
@@ -1473,6 +1551,24 @@ impl fmt::Display for Statement {
                 if *cascade { " CASCADE" } else { "" },
                 if *purge { " PURGE" } else { "" }
             ),
+            Statement::SetRole {
+                local,
+                session,
+                role_name,
+            } => {
+                write!(
+                    f,
+                    "SET {local}{session}ROLE",
+                    local = if *local { "LOCAL " } else { "" },
+                    session = if *session { "SESSION " } else { "" },
+                )?;
+                if let Some(role_name) = role_name {
+                    write!(f, " {}", role_name)?;
+                } else {
+                    f.write_str(" NONE")?;
+                }
+                Ok(())
+            }
             Statement::SetVariable {
                 local,
                 variable,
@@ -2205,6 +2301,159 @@ impl fmt::Display for SqliteOnConflict {
             Fail => write!(f, "FAIL"),
             Ignore => write!(f, "IGNORE"),
             Replace => write!(f, "REPLACE"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CopyTarget {
+    Stdin,
+    Stdout,
+    File {
+        /// The path name of the input or output file.
+        filename: String,
+    },
+    Program {
+        /// A command to execute
+        command: String,
+    },
+}
+
+impl fmt::Display for CopyTarget {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use CopyTarget::*;
+        match self {
+            Stdin { .. } => write!(f, "STDIN"),
+            Stdout => write!(f, "STDOUT"),
+            File { filename } => write!(f, "'{}'", value::escape_single_quote_string(filename)),
+            Program { command } => write!(
+                f,
+                "PROGRAM '{}'",
+                value::escape_single_quote_string(command)
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum OnCommit {
+    DeleteRows,
+    PreserveRows,
+    Drop,
+}
+
+/// An option in `COPY` statement.
+///
+/// <https://www.postgresql.org/docs/14/sql-copy.html>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CopyOption {
+    /// FORMAT format_name
+    Format(Ident),
+    /// FREEZE \[ boolean \]
+    Freeze(bool),
+    /// DELIMITER 'delimiter_character'
+    Delimiter(char),
+    /// NULL 'null_string'
+    Null(String),
+    /// HEADER \[ boolean \]
+    Header(bool),
+    /// QUOTE 'quote_character'
+    Quote(char),
+    /// ESCAPE 'escape_character'
+    Escape(char),
+    /// FORCE_QUOTE { ( column_name [, ...] ) | * }
+    ForceQuote(Vec<Ident>),
+    /// FORCE_NOT_NULL ( column_name [, ...] )
+    ForceNotNull(Vec<Ident>),
+    /// FORCE_NULL ( column_name [, ...] )
+    ForceNull(Vec<Ident>),
+    /// ENCODING 'encoding_name'
+    Encoding(String),
+}
+
+impl fmt::Display for CopyOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use CopyOption::*;
+        match self {
+            Format(name) => write!(f, "FORMAT {}", name),
+            Freeze(true) => write!(f, "FREEZE"),
+            Freeze(false) => write!(f, "FREEZE FALSE"),
+            Delimiter(char) => write!(f, "DELIMITER '{}'", char),
+            Null(string) => write!(f, "NULL '{}'", value::escape_single_quote_string(string)),
+            Header(true) => write!(f, "HEADER"),
+            Header(false) => write!(f, "HEADER FALSE"),
+            Quote(char) => write!(f, "QUOTE '{}'", char),
+            Escape(char) => write!(f, "ESCAPE '{}'", char),
+            ForceQuote(columns) => write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns)),
+            ForceNotNull(columns) => {
+                write!(f, "FORCE_NOT_NULL ({})", display_comma_separated(columns))
+            }
+            ForceNull(columns) => write!(f, "FORCE_NULL ({})", display_comma_separated(columns)),
+            Encoding(name) => write!(f, "ENCODING '{}'", value::escape_single_quote_string(name)),
+        }
+    }
+}
+
+/// An option in `COPY` statement before PostgreSQL version 9.0.
+///
+/// <https://www.postgresql.org/docs/8.4/sql-copy.html>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CopyLegacyOption {
+    /// BINARY
+    Binary,
+    /// DELIMITER \[ AS \] 'delimiter_character'
+    Delimiter(char),
+    /// NULL \[ AS \] 'null_string'
+    Null(String),
+    /// CSV ...
+    Csv(Vec<CopyLegacyCsvOption>),
+}
+
+impl fmt::Display for CopyLegacyOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use CopyLegacyOption::*;
+        match self {
+            Binary => write!(f, "BINARY"),
+            Delimiter(char) => write!(f, "DELIMITER '{}'", char),
+            Null(string) => write!(f, "NULL '{}'", value::escape_single_quote_string(string)),
+            Csv(opts) => write!(f, "CSV {}", display_separated(opts, " ")),
+        }
+    }
+}
+
+/// A `CSV` option in `COPY` statement before PostgreSQL version 9.0.
+///
+/// <https://www.postgresql.org/docs/8.4/sql-copy.html>
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CopyLegacyCsvOption {
+    /// HEADER
+    Header,
+    /// QUOTE \[ AS \] 'quote_character'
+    Quote(char),
+    /// ESCAPE \[ AS \] 'escape_character'
+    Escape(char),
+    /// FORCE QUOTE { column_name [, ...] | * }
+    ForceQuote(Vec<Ident>),
+    /// FORCE NOT NULL column_name [, ...]
+    ForceNotNull(Vec<Ident>),
+}
+
+impl fmt::Display for CopyLegacyCsvOption {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use CopyLegacyCsvOption::*;
+        match self {
+            Header => write!(f, "HEADER"),
+            Quote(char) => write!(f, "QUOTE '{}'", char),
+            Escape(char) => write!(f, "ESCAPE '{}'", char),
+            ForceQuote(columns) => write!(f, "FORCE QUOTE {}", display_comma_separated(columns)),
+            ForceNotNull(columns) => {
+                write!(f, "FORCE NOT NULL {}", display_comma_separated(columns))
+            }
         }
     }
 }

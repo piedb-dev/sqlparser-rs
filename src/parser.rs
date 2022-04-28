@@ -423,6 +423,7 @@ impl<'a> Parser<'a> {
                 Keyword::TRY_CAST => self.parse_try_cast_expr(),
                 Keyword::EXISTS => self.parse_exists_expr(),
                 Keyword::EXTRACT => self.parse_extract_expr(),
+                Keyword::POSITION => self.parse_position_expr(),
                 Keyword::SUBSTRING => self.parse_substring_expr(),
                 Keyword::TRIM => self.parse_trim_expr(),
                 Keyword::INTERVAL => self.parse_literal_interval(),
@@ -799,6 +800,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    pub fn parse_position_expr(&mut self) -> Result<Expr, ParserError> {
+        // PARSE SELECT POSITION('@' in field)
+        self.expect_token(&Token::LParen)?;
+
+        // Parse the subexpr till the IN keyword
+        let expr = self.parse_subexpr(Self::BETWEEN_PREC)?;
+        if self.parse_keyword(Keyword::IN) {
+            let from = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            Ok(Expr::Position {
+                expr: Box::new(expr),
+                r#in: Box::new(from),
+            })
+        } else {
+            return parser_err!("Position function must include IN keyword".to_string());
+        }
+    }
+
     pub fn parse_substring_expr(&mut self) -> Result<Expr, ParserError> {
         // PARSE SUBSTRING (EXPR [FROM 1] [FOR 3])
         self.expect_token(&Token::LParen)?;
@@ -1166,6 +1185,23 @@ impl<'a> Parser<'a> {
                 return self.parse_array_index(expr);
             }
             self.parse_map_access(expr)
+        } else if Token::Arrow == tok
+            || Token::LongArrow == tok
+            || Token::HashArrow == tok
+            || Token::HashLongArrow == tok
+        {
+            let operator = match tok {
+                Token::Arrow => JsonOperator::Arrow,
+                Token::LongArrow => JsonOperator::LongArrow,
+                Token::HashArrow => JsonOperator::HashArrow,
+                Token::HashLongArrow => JsonOperator::HashLongArrow,
+                _ => unreachable!(),
+            };
+            Ok(Expr::JsonAccess {
+                left: Box::new(expr),
+                operator,
+                right: Box::new(self.parse_expr()?),
+            })
         } else {
             // Can only happen if `get_next_precedence` got out of sync with this function
             parser_err!(format!("No infix parser for token {:?}", tok))
@@ -1312,7 +1348,11 @@ impl<'a> Parser<'a> {
             Token::Mul | Token::Div | Token::Mod | Token::StringConcat => Ok(40),
             Token::DoubleColon => Ok(50),
             Token::ExclamationMark => Ok(50),
-            Token::LBracket => Ok(50),
+            Token::LBracket
+            | Token::LongArrow
+            | Token::Arrow
+            | Token::HashArrow
+            | Token::HashLongArrow => Ok(50),
             _ => Ok(0),
         }
     }
@@ -1519,11 +1559,20 @@ impl<'a> Parser<'a> {
     /// Parse a SQL CREATE statement
     pub fn parse_create(&mut self) -> Result<Statement, ParserError> {
         let or_replace = self.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
+        let local = self.parse_one_of_keywords(&[Keyword::LOCAL]).is_some();
+        let global = self.parse_one_of_keywords(&[Keyword::GLOBAL]).is_some();
+        let global: Option<bool> = if global {
+            Some(true)
+        } else if local {
+            Some(false)
+        } else {
+            None
+        };
         let temporary = self
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
         if self.parse_keyword(Keyword::TABLE) {
-            self.parse_create_table(or_replace, temporary)
+            self.parse_create_table(or_replace, temporary, global)
         } else if self.parse_keyword(Keyword::MATERIALIZED) || self.parse_keyword(Keyword::VIEW) {
             self.prev_token();
             self.parse_create_view(or_replace)
@@ -1633,6 +1682,7 @@ impl<'a> Parser<'a> {
             or_replace,
             if_not_exists,
             external: true,
+            global: None,
             temporary: false,
             file_format,
             location,
@@ -1642,6 +1692,7 @@ impl<'a> Parser<'a> {
             default_charset: None,
             engine: None,
             collation: None,
+            on_commit: None,
         })
     }
 
@@ -1790,6 +1841,7 @@ impl<'a> Parser<'a> {
         &mut self,
         or_replace: bool,
         temporary: bool,
+        global: Option<bool>,
     ) -> Result<Statement, ParserError> {
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
         let table_name = self.parse_object_name()?;
@@ -1846,6 +1898,23 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let on_commit: Option<OnCommit> =
+            if self.parse_keywords(&[Keyword::ON, Keyword::COMMIT, Keyword::DELETE, Keyword::ROWS])
+            {
+                Some(OnCommit::DeleteRows)
+            } else if self.parse_keywords(&[
+                Keyword::ON,
+                Keyword::COMMIT,
+                Keyword::PRESERVE,
+                Keyword::ROWS,
+            ]) {
+                Some(OnCommit::PreserveRows)
+            } else if self.parse_keywords(&[Keyword::ON, Keyword::COMMIT, Keyword::DROP]) {
+                Some(OnCommit::Drop)
+            } else {
+                None
+            };
+
         Ok(Statement::CreateTable {
             name: table_name,
             temporary,
@@ -1858,6 +1927,7 @@ impl<'a> Parser<'a> {
             hive_distribution,
             hive_formats: Some(hive_formats),
             external: false,
+            global,
             file_format: None,
             location: None,
             query,
@@ -1866,6 +1936,7 @@ impl<'a> Parser<'a> {
             engine,
             default_charset,
             collation,
+            on_commit,
         })
     }
 
@@ -2256,51 +2327,160 @@ impl<'a> Parser<'a> {
     pub fn parse_copy(&mut self) -> Result<Statement, ParserError> {
         let table_name = self.parse_object_name()?;
         let columns = self.parse_parenthesized_column_list(Optional)?;
-        let to_or_from = self.expect_one_of_keywords(&[Keyword::FROM, Keyword::TO])?;
-        let to: bool = match to_or_from {
-            Keyword::TO => true,
-            Keyword::FROM => false,
-            _ => unreachable!("something wrong while parsing copy statment :("),
+        let to = match self.parse_one_of_keywords(&[Keyword::FROM, Keyword::TO]) {
+            Some(Keyword::FROM) => false,
+            Some(Keyword::TO) => true,
+            _ => self.expected("FROM or TO", self.peek_token())?,
         };
-        let mut filename = None;
-        // check whether data has to be copied form table or std in.
-        if !self.parse_keyword(Keyword::STDIN) {
-            filename = Some(self.parse_identifier()?)
-        }
-        // parse copy options.
-        let mut delimiter = None;
-        let mut csv_header = false;
-        loop {
-            if let Some(keyword) = self.parse_one_of_keywords(&[Keyword::DELIMITER, Keyword::CSV]) {
-                match keyword {
-                    Keyword::DELIMITER => {
-                        delimiter = Some(self.parse_identifier()?);
-                        continue;
-                    }
-                    Keyword::CSV => {
-                        self.expect_keyword(Keyword::HEADER)?;
-                        csv_header = true
-                    }
-                    _ => unreachable!("something wrong while parsing copy statment :("),
-                }
+        let target = if self.parse_keyword(Keyword::STDIN) {
+            CopyTarget::Stdin
+        } else if self.parse_keyword(Keyword::STDOUT) {
+            CopyTarget::Stdout
+        } else if self.parse_keyword(Keyword::PROGRAM) {
+            CopyTarget::Program {
+                command: self.parse_literal_string()?,
             }
-            break;
+        } else {
+            CopyTarget::File {
+                filename: self.parse_literal_string()?,
+            }
+        };
+        let _ = self.parse_keyword(Keyword::WITH);
+        let mut options = vec![];
+        if self.consume_token(&Token::LParen) {
+            options = self.parse_comma_separated(Parser::parse_copy_option)?;
+            self.expect_token(&Token::RParen)?;
         }
-        // copy the values from stdin if there is no file to be copied from.
-        let mut values = vec![];
-        if filename.is_none() {
+        let mut legacy_options = vec![];
+        while let Some(opt) = self.maybe_parse(|parser| parser.parse_copy_legacy_option()) {
+            legacy_options.push(opt);
+        }
+        let values = if let CopyTarget::Stdin = target {
             self.expect_token(&Token::SemiColon)?;
-            values = self.parse_tsv();
-        }
+            self.parse_tsv()
+        } else {
+            vec![]
+        };
         Ok(Statement::Copy {
             table_name,
             columns,
-            values,
-            filename,
-            delimiter,
-            csv_header,
             to,
+            target,
+            options,
+            legacy_options,
+            values,
         })
+    }
+
+    fn parse_copy_option(&mut self) -> Result<CopyOption, ParserError> {
+        let ret = match self.parse_one_of_keywords(&[
+            Keyword::FORMAT,
+            Keyword::FREEZE,
+            Keyword::DELIMITER,
+            Keyword::NULL,
+            Keyword::HEADER,
+            Keyword::QUOTE,
+            Keyword::ESCAPE,
+            Keyword::FORCE_QUOTE,
+            Keyword::FORCE_NOT_NULL,
+            Keyword::FORCE_NULL,
+            Keyword::ENCODING,
+        ]) {
+            Some(Keyword::FORMAT) => CopyOption::Format(self.parse_identifier()?),
+            Some(Keyword::FREEZE) => CopyOption::Freeze(!matches!(
+                self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
+                Some(Keyword::FALSE)
+            )),
+            Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_literal_char()?),
+            Some(Keyword::NULL) => CopyOption::Null(self.parse_literal_string()?),
+            Some(Keyword::HEADER) => CopyOption::Header(!matches!(
+                self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
+                Some(Keyword::FALSE)
+            )),
+            Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
+            Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
+            Some(Keyword::FORCE_QUOTE) => {
+                CopyOption::ForceQuote(self.parse_parenthesized_column_list(Mandatory)?)
+            }
+            Some(Keyword::FORCE_NOT_NULL) => {
+                CopyOption::ForceNotNull(self.parse_parenthesized_column_list(Mandatory)?)
+            }
+            Some(Keyword::FORCE_NULL) => {
+                CopyOption::ForceNull(self.parse_parenthesized_column_list(Mandatory)?)
+            }
+            Some(Keyword::ENCODING) => CopyOption::Encoding(self.parse_literal_string()?),
+            _ => self.expected("option", self.peek_token())?,
+        };
+        Ok(ret)
+    }
+
+    fn parse_copy_legacy_option(&mut self) -> Result<CopyLegacyOption, ParserError> {
+        let ret = match self.parse_one_of_keywords(&[
+            Keyword::BINARY,
+            Keyword::DELIMITER,
+            Keyword::NULL,
+            Keyword::CSV,
+        ]) {
+            Some(Keyword::BINARY) => CopyLegacyOption::Binary,
+            Some(Keyword::DELIMITER) => {
+                let _ = self.parse_keyword(Keyword::AS); // [ AS ]
+                CopyLegacyOption::Delimiter(self.parse_literal_char()?)
+            }
+            Some(Keyword::NULL) => {
+                let _ = self.parse_keyword(Keyword::AS); // [ AS ]
+                CopyLegacyOption::Null(self.parse_literal_string()?)
+            }
+            Some(Keyword::CSV) => CopyLegacyOption::Csv({
+                let mut opts = vec![];
+                while let Some(opt) =
+                    self.maybe_parse(|parser| parser.parse_copy_legacy_csv_option())
+                {
+                    opts.push(opt);
+                }
+                opts
+            }),
+            _ => self.expected("option", self.peek_token())?,
+        };
+        Ok(ret)
+    }
+
+    fn parse_copy_legacy_csv_option(&mut self) -> Result<CopyLegacyCsvOption, ParserError> {
+        let ret = match self.parse_one_of_keywords(&[
+            Keyword::HEADER,
+            Keyword::QUOTE,
+            Keyword::ESCAPE,
+            Keyword::FORCE,
+        ]) {
+            Some(Keyword::HEADER) => CopyLegacyCsvOption::Header,
+            Some(Keyword::QUOTE) => {
+                let _ = self.parse_keyword(Keyword::AS); // [ AS ]
+                CopyLegacyCsvOption::Quote(self.parse_literal_char()?)
+            }
+            Some(Keyword::ESCAPE) => {
+                let _ = self.parse_keyword(Keyword::AS); // [ AS ]
+                CopyLegacyCsvOption::Escape(self.parse_literal_char()?)
+            }
+            Some(Keyword::FORCE) if self.parse_keywords(&[Keyword::NOT, Keyword::NULL]) => {
+                CopyLegacyCsvOption::ForceNotNull(
+                    self.parse_comma_separated(Parser::parse_identifier)?,
+                )
+            }
+            Some(Keyword::FORCE) if self.parse_keywords(&[Keyword::QUOTE]) => {
+                CopyLegacyCsvOption::ForceQuote(
+                    self.parse_comma_separated(Parser::parse_identifier)?,
+                )
+            }
+            _ => self.expected("csv option", self.peek_token())?,
+        };
+        Ok(ret)
+    }
+
+    fn parse_literal_char(&mut self) -> Result<char, ParserError> {
+        let s = self.parse_literal_string()?;
+        if s.len() != 1 {
+            return parser_err!(format!("Expect a char, found {:?}", s));
+        }
+        Ok(s.chars().next().unwrap())
     }
 
     /// Parse a tab separated values in
@@ -2460,6 +2640,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::VARCHAR => Ok(DataType::Varchar(self.parse_optional_precision()?)),
+                Keyword::NVARCHAR => Ok(DataType::Nvarchar(self.parse_optional_precision()?)),
                 Keyword::CHAR | Keyword::CHARACTER => {
                     let is_var = self.parse_keyword(Keyword::VARYING);
                     let precision = self.parse_optional_precision()?;
@@ -3038,7 +3219,19 @@ impl<'a> Parser<'a> {
             self.parse_one_of_keywords(&[Keyword::SESSION, Keyword::LOCAL, Keyword::HIVEVAR]);
         if let Some(Keyword::HIVEVAR) = modifier {
             self.expect_token(&Token::Colon)?;
+        } else if self.parse_keyword(Keyword::ROLE) {
+            let role_name = if self.parse_keyword(Keyword::NONE) {
+                None
+            } else {
+                Some(self.parse_identifier()?)
+            };
+            return Ok(Statement::SetRole {
+                local: modifier == Some(Keyword::LOCAL),
+                session: modifier == Some(Keyword::SESSION),
+                role_name,
+            });
         }
+
         let variable = self.parse_identifier()?;
         if self.consume_token(&Token::Eq) || self.parse_keyword(Keyword::TO) {
             let mut values = vec![];
@@ -3657,6 +3850,11 @@ impl<'a> Parser<'a> {
         let table = self.parse_table_and_joins()?;
         self.expect_keyword(Keyword::SET)?;
         let assignments = self.parse_comma_separated(Parser::parse_assignment)?;
+        let from = if self.parse_keyword(Keyword::FROM) && dialect_of!(self is PostgreSqlDialect) {
+            Some(self.parse_table_and_joins()?)
+        } else {
+            None
+        };
         let selection = if self.parse_keyword(Keyword::WHERE) {
             Some(self.parse_expr()?)
         } else {
@@ -3665,6 +3863,7 @@ impl<'a> Parser<'a> {
         Ok(Statement::Update {
             table,
             assignments,
+            from,
             selection,
         })
     }
