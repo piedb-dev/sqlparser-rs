@@ -15,7 +15,9 @@
 //! Test SQL syntax specific to Hive. The parser based on the generic dialect
 //! is also tested (on the inputs it can handle).
 
-use sqlparser::dialect::HiveDialect;
+use sqlparser::ast::{CreateFunctionUsing, Ident, ObjectName, SetVariableValue, Statement};
+use sqlparser::dialect::{GenericDialect, HiveDialect};
+use sqlparser::parser::ParserError;
 use sqlparser::test_utils::*;
 
 #[test]
@@ -203,6 +205,72 @@ fn from_cte() {
     let rename =
         "WITH cte AS (SELECT * FROM a.b) FROM cte INSERT INTO TABLE a.b PARTITION (a) SELECT *";
     println!("{}", hive().verified_stmt(rename));
+}
+
+#[test]
+fn set_statement_with_minus() {
+    assert_eq!(
+        hive().verified_stmt("SET hive.tez.java.opts = -Xmx4g"),
+        Statement::SetVariable {
+            local: false,
+            hivevar: false,
+            variable: ObjectName(vec![
+                Ident::new("hive"),
+                Ident::new("tez"),
+                Ident::new("java"),
+                Ident::new("opts")
+            ]),
+            value: vec![SetVariableValue::Ident("-Xmx4g".into())],
+        }
+    );
+
+    assert_eq!(
+        hive().parse_sql_statements("SET hive.tez.java.opts = -"),
+        Err(ParserError::ParserError(
+            "Expected word, found: EOF".to_string()
+        ))
+    )
+}
+
+#[test]
+fn parse_create_function() {
+    let sql = "CREATE TEMPORARY FUNCTION mydb.myfunc AS 'org.random.class.Name' USING JAR 'hdfs://somewhere.com:8020/very/far'";
+    match hive().verified_stmt(sql) {
+        Statement::CreateFunction {
+            temporary,
+            name,
+            class_name,
+            using,
+        } => {
+            assert!(temporary);
+            assert_eq!("mydb.myfunc", name.to_string());
+            assert_eq!("org.random.class.Name", class_name);
+            assert_eq!(
+                using,
+                Some(CreateFunctionUsing::Jar(
+                    "hdfs://somewhere.com:8020/very/far".to_string()
+                ))
+            )
+        }
+        _ => unreachable!(),
+    }
+
+    let generic = TestedDialects {
+        dialects: vec![Box::new(GenericDialect {})],
+    };
+
+    assert_eq!(
+        generic.parse_sql_statements(sql).unwrap_err(),
+        ParserError::ParserError(
+            "Expected an object type after CREATE, found: FUNCTION".to_string()
+        )
+    );
+
+    let sql = "CREATE TEMPORARY FUNCTION mydb.myfunc AS 'org.random.class.Name' USING JAR";
+    assert_eq!(
+        hive().parse_sql_statements(sql).unwrap_err(),
+        ParserError::ParserError("Expected literal string, found: EOF".to_string()),
+    );
 }
 
 fn hive() -> TestedDialects {

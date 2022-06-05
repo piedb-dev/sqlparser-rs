@@ -30,6 +30,9 @@ pub enum Value {
     Number(BigDecimal, bool),
     /// 'string value'
     SingleQuotedString(String),
+    /// e'string value' (postgres extension)
+    /// <https://www.postgresql.org/docs/8.3/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS
+    EscapedStringLiteral(String),
     /// N'string value'
     NationalStringLiteral(String),
     /// X'hex value'
@@ -69,6 +72,7 @@ impl fmt::Display for Value {
             Value::Number(v, l) => write!(f, "{}{long}", v, long = if *l { "L" } else { "" }),
             Value::DoubleQuotedString(v) => write!(f, "\"{}\"", v),
             Value::SingleQuotedString(v) => write!(f, "'{}'", escape_single_quote_string(v)),
+            Value::EscapedStringLiteral(v) => write!(f, "E'{}'", escape_escaped_string(v)),
             Value::NationalStringLiteral(v) => write!(f, "N'{}'", v),
             Value::HexStringLiteral(v) => write!(f, "X'{}'", v),
             Value::Boolean(v) => write!(f, "{}", v),
@@ -174,13 +178,16 @@ impl fmt::Display for DateTimeField {
     }
 }
 
-pub struct EscapeSingleQuoteString<'a>(&'a str);
+pub struct EscapeQuotedString<'a> {
+    string: &'a str,
+    quote: char,
+}
 
-impl<'a> fmt::Display for EscapeSingleQuoteString<'a> {
+impl<'a> fmt::Display for EscapeQuotedString<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for c in self.0.chars() {
-            if c == '\'' {
-                write!(f, "\'\'")?;
+        for c in self.string.chars() {
+            if c == self.quote {
+                write!(f, "{q}{q}", q = self.quote)?;
             } else {
                 write!(f, "{}", c)?;
             }
@@ -189,8 +196,46 @@ impl<'a> fmt::Display for EscapeSingleQuoteString<'a> {
     }
 }
 
-pub fn escape_single_quote_string(s: &str) -> EscapeSingleQuoteString<'_> {
-    EscapeSingleQuoteString(s)
+pub fn escape_quoted_string(string: &str, quote: char) -> EscapeQuotedString<'_> {
+    EscapeQuotedString { string, quote }
+}
+
+pub fn escape_single_quote_string(s: &str) -> EscapeQuotedString<'_> {
+    escape_quoted_string(s, '\'')
+}
+
+pub struct EscapeEscapedStringLiteral<'a>(&'a str);
+
+impl<'a> fmt::Display for EscapeEscapedStringLiteral<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for c in self.0.chars() {
+            match c {
+                '\'' => {
+                    write!(f, r#"\'"#)?;
+                }
+                '\\' => {
+                    write!(f, r#"\\"#)?;
+                }
+                '\n' => {
+                    write!(f, r#"\n"#)?;
+                }
+                '\t' => {
+                    write!(f, r#"\t"#)?;
+                }
+                '\r' => {
+                    write!(f, r#"\r"#)?;
+                }
+                _ => {
+                    write!(f, "{}", c)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn escape_escaped_string(s: &str) -> EscapeEscapedStringLiteral<'_> {
+    EscapeEscapedStringLiteral(s)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

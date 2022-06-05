@@ -18,6 +18,7 @@
 mod test_utils;
 use test_utils::*;
 
+use sqlparser::ast::Value::Boolean;
 use sqlparser::ast::*;
 use sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use sqlparser::parser::ParserError;
@@ -412,7 +413,7 @@ fn parse_update_set_from() {
                 relation: TableFactor::Table {
                     name: ObjectName(vec![Ident::new("t1")]),
                     alias: None,
-                    args: vec![],
+                    args: None,
                     with_hints: vec![],
                 },
                 joins: vec![],
@@ -438,7 +439,7 @@ fn parse_update_set_from() {
                                 relation: TableFactor::Table {
                                     name: ObjectName(vec![Ident::new("t1")]),
                                     alias: None,
-                                    args: vec![],
+                                    args: None,
                                     with_hints: vec![],
                                 },
                                 joins: vec![],
@@ -450,6 +451,7 @@ fn parse_update_set_from() {
                             distribute_by: vec![],
                             sort_by: vec![],
                             having: None,
+                            qualify: None
                         })),
                         order_by: vec![],
                         limit: None,
@@ -589,7 +591,7 @@ fn test_copy_to() {
 
 #[test]
 fn parse_copy_from() {
-    let sql = "COPY table (a, b) FROM 'file.csv' WITH 
+    let sql = "COPY table (a, b) FROM 'file.csv' WITH
     (
         FORMAT CSV,
         FREEZE,
@@ -779,7 +781,7 @@ fn parse_set() {
         Statement::SetVariable {
             local: false,
             hivevar: false,
-            variable: "a".into(),
+            variable: ObjectName(vec![Ident::new("a")]),
             value: vec![SetVariableValue::Ident("b".into())],
         }
     );
@@ -790,7 +792,7 @@ fn parse_set() {
         Statement::SetVariable {
             local: false,
             hivevar: false,
-            variable: "a".into(),
+            variable: ObjectName(vec![Ident::new("a")]),
             value: vec![SetVariableValue::Literal(Value::SingleQuotedString(
                 "b".into()
             ))],
@@ -803,7 +805,7 @@ fn parse_set() {
         Statement::SetVariable {
             local: false,
             hivevar: false,
-            variable: "a".into(),
+            variable: ObjectName(vec![Ident::new("a")]),
             value: vec![SetVariableValue::Literal(number("0"))],
         }
     );
@@ -814,7 +816,7 @@ fn parse_set() {
         Statement::SetVariable {
             local: false,
             hivevar: false,
-            variable: "a".into(),
+            variable: ObjectName(vec![Ident::new("a")]),
             value: vec![SetVariableValue::Ident("DEFAULT".into())],
         }
     );
@@ -825,8 +827,39 @@ fn parse_set() {
         Statement::SetVariable {
             local: true,
             hivevar: false,
-            variable: "a".into(),
+            variable: ObjectName(vec![Ident::new("a")]),
             value: vec![SetVariableValue::Ident("b".into())],
+        }
+    );
+
+    let stmt = pg_and_generic().verified_stmt("SET a.b.c = b");
+    assert_eq!(
+        stmt,
+        Statement::SetVariable {
+            local: false,
+            hivevar: false,
+            variable: ObjectName(vec![Ident::new("a"), Ident::new("b"), Ident::new("c")]),
+            value: vec![SetVariableValue::Ident("b".into())],
+        }
+    );
+
+    let stmt = pg_and_generic().one_statement_parses_to(
+        "SET hive.tez.auto.reducer.parallelism=false",
+        "SET hive.tez.auto.reducer.parallelism = false",
+    );
+    assert_eq!(
+        stmt,
+        Statement::SetVariable {
+            local: false,
+            hivevar: false,
+            variable: ObjectName(vec![
+                Ident::new("hive"),
+                Ident::new("tez"),
+                Ident::new("auto"),
+                Ident::new("reducer"),
+                Ident::new("parallelism")
+            ]),
+            value: vec![SetVariableValue::Literal(Boolean(false))],
         }
     );
 
@@ -1136,31 +1169,31 @@ fn parse_array_index_expr() {
         .collect();
 
     let sql = "SELECT foo[0] FROM foos";
-    let select = pg().verified_only_select(sql);
+    let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::ArrayIndex {
             obj: Box::new(Expr::Identifier(Ident::new("foo"))),
-            indexs: vec![num[0].clone()],
+            indexes: vec![num[0].clone()],
         },
         expr_from_projection(only(&select.projection)),
     );
 
     let sql = "SELECT foo[0][0] FROM foos";
-    let select = pg().verified_only_select(sql);
+    let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::ArrayIndex {
             obj: Box::new(Expr::Identifier(Ident::new("foo"))),
-            indexs: vec![num[0].clone(), num[0].clone()],
+            indexes: vec![num[0].clone(), num[0].clone()],
         },
         expr_from_projection(only(&select.projection)),
     );
 
     let sql = r#"SELECT bar[0]["baz"]["fooz"] FROM foos"#;
-    let select = pg().verified_only_select(sql);
+    let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::ArrayIndex {
             obj: Box::new(Expr::Identifier(Ident::new("bar"))),
-            indexs: vec![
+            indexes: vec![
                 num[0].clone(),
                 Expr::Identifier(Ident {
                     value: "baz".to_string(),
@@ -1176,7 +1209,7 @@ fn parse_array_index_expr() {
     );
 
     let sql = "SELECT (CAST(ARRAY[ARRAY[2, 3]] AS INT[][]))[1][2]";
-    let select = pg().verified_only_select(sql);
+    let select = pg_and_generic().verified_only_select(sql);
     assert_eq!(
         &Expr::ArrayIndex {
             obj: Box::new(Expr::Nested(Box::new(Expr::Cast {
@@ -1192,7 +1225,7 @@ fn parse_array_index_expr() {
                 ))))),
                 collation: None,
             }))),
-            indexs: vec![num[1].clone(), num[2].clone()],
+            indexes: vec![num[1].clone(), num[2].clone()],
         },
         expr_from_projection(only(&select.projection)),
     );
@@ -1303,6 +1336,67 @@ fn test_json() {
 }
 
 #[test]
+fn test_composite_value() {
+    let sql = "SELECT (on_hand.item).name FROM on_hand WHERE (on_hand.item).price > 9";
+    let select = pg().verified_only_select(sql);
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::CompositeAccess {
+            key: Ident::new("name"),
+            expr: Box::new(Expr::Nested(Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("on_hand"),
+                Ident::new("item")
+            ]))))
+        }),
+        select.projection[0]
+    );
+
+    #[cfg(feature = "bigdecimal")]
+    let num: Expr = Expr::Value(Value::Number(bigdecimal::BigDecimal::from(9), false));
+    #[cfg(not(feature = "bigdecimal"))]
+    let num: Expr = Expr::Value(Value::Number("9".to_string(), false));
+    assert_eq!(
+        select.selection,
+        Some(Expr::BinaryOp {
+            left: Box::new(Expr::CompositeAccess {
+                key: Ident::new("price"),
+                expr: Box::new(Expr::Nested(Box::new(Expr::CompoundIdentifier(vec![
+                    Ident::new("on_hand"),
+                    Ident::new("item")
+                ]))))
+            }),
+            op: BinaryOperator::Gt,
+            right: Box::new(num)
+        })
+    );
+
+    let sql = "SELECT (information_schema._pg_expandarray(ARRAY['i', 'i'])).n";
+    let select = pg().verified_only_select(sql);
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::CompositeAccess {
+            key: Ident::new("n"),
+            expr: Box::new(Expr::Nested(Box::new(Expr::Function(Function {
+                name: ObjectName(vec![
+                    Ident::new("information_schema"),
+                    Ident::new("_pg_expandarray")
+                ]),
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Array(
+                    Array {
+                        elem: vec![
+                            Expr::Value(Value::SingleQuotedString("i".to_string())),
+                            Expr::Value(Value::SingleQuotedString("i".to_string())),
+                        ],
+                        named: true
+                    }
+                )))],
+                over: None,
+                distinct: false,
+            }))))
+        }),
+        select.projection[0]
+    );
+}
+
+#[test]
 fn parse_comments() {
     match pg().verified_stmt("COMMENT ON COLUMN tab.name IS 'comment'") {
         Statement::Comment {
@@ -1349,6 +1443,11 @@ fn parse_quoted_identifier() {
 }
 
 #[test]
+fn parse_quoted_identifier_2() {
+    pg_and_generic().verified_stmt(r#"SELECT """quoted ident""""#);
+}
+
+#[test]
 fn parse_local_and_global() {
     pg_and_generic().verified_stmt("CREATE LOCAL TEMPORARY TABLE table (COL INT)");
 }
@@ -1373,4 +1472,69 @@ fn pg_and_generic() -> TestedDialects {
     TestedDialects {
         dialects: vec![Box::new(PostgreSqlDialect {}), Box::new(GenericDialect {})],
     }
+}
+
+#[test]
+fn parse_escaped_literal_string() {
+    let sql =
+        r#"SELECT E's1 \n s1', E's2 \\n s2', E's3 \\\n s3', E's4 \\\\n s4', E'\'', E'foo \\'"#;
+    let select = pg_and_generic().verified_only_select(sql);
+    assert_eq!(6, select.projection.len());
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("s1 \n s1".to_string())),
+        expr_from_projection(&select.projection[0])
+    );
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("s2 \\n s2".to_string())),
+        expr_from_projection(&select.projection[1])
+    );
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("s3 \\\n s3".to_string())),
+        expr_from_projection(&select.projection[2])
+    );
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("s4 \\\\n s4".to_string())),
+        expr_from_projection(&select.projection[3])
+    );
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("'".to_string())),
+        expr_from_projection(&select.projection[4])
+    );
+    assert_eq!(
+        &Expr::Value(Value::EscapedStringLiteral("foo \\".to_string())),
+        expr_from_projection(&select.projection[5])
+    );
+
+    let sql = r#"SELECT E'\'"#;
+    assert_eq!(
+        pg_and_generic()
+            .parse_sql_statements(sql)
+            .unwrap_err()
+            .to_string(),
+        "sql parser error: Unterminated encoded string literal at Line: 1, Column 8"
+    );
+}
+
+#[test]
+fn parse_fetch() {
+    pg_and_generic().verified_stmt("FETCH 2048 IN \"SQL_CUR0x7fa44801bc00\"");
+    pg_and_generic().verified_stmt("FETCH 2048 IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH NEXT IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH PRIOR IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH FIRST IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH LAST IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH ABSOLUTE 2048 IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH RELATIVE 2048 IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH ALL IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic().verified_stmt("FETCH ALL IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH FORWARD 2048 IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH FORWARD ALL IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH BACKWARD 2048 IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
+    pg_and_generic()
+        .verified_stmt("FETCH BACKWARD ALL IN \"SQL_CUR0x7fa44801bc00\" INTO \"new_table\"");
 }

@@ -51,6 +51,8 @@ pub enum Token {
     SingleQuotedString(String),
     /// "National" string literal: i.e: N'string'
     NationalStringLiteral(String),
+    /// "escaped" string literal, which are an extension to the SQL standard: i.e: e'first \n second' or E 'first \n second'
+    EscapedStringLiteral(String),
     /// Hexadecimal string literal: i.e.: X'deadbeef'
     HexStringLiteral(String),
     /// Comma
@@ -162,6 +164,7 @@ impl fmt::Display for Token {
             Token::Char(ref c) => write!(f, "{}", c),
             Token::SingleQuotedString(ref s) => write!(f, "'{}'", s),
             Token::NationalStringLiteral(ref s) => write!(f, "N'{}'", s),
+            Token::EscapedStringLiteral(ref s) => write!(f, "E'{}'", s),
             Token::HexStringLiteral(ref s) => write!(f, "X'{}'", s),
             Token::Comma => f.write_str(","),
             Token::Whitespace(ws) => write!(f, "{}", ws),
@@ -395,6 +398,21 @@ impl<'a> Tokenizer<'a> {
                         }
                     }
                 }
+                // PostgreSQL accepts "escape" string constants, which are an extension to the SQL standard.
+                x @ 'e' | x @ 'E' => {
+                    chars.next(); // consume, to check the next char
+                    match chars.peek() {
+                        Some('\'') => {
+                            let s = self.tokenize_escaped_single_quoted_string(chars)?;
+                            Ok(Some(Token::EscapedStringLiteral(s)))
+                        }
+                        _ => {
+                            // regular identifier starting with an "E" or "e"
+                            let s = self.tokenize_word(x, chars);
+                            Ok(Some(Token::make_word(&s, None)))
+                        }
+                    }
+                }
                 // The spec only allows an uppercase 'X' to introduce a hex
                 // string, but PostgreSQL, at least, allows a lowercase 'x' too.
                 x @ 'x' | x @ 'X' => {
@@ -434,7 +452,12 @@ impl<'a> Tokenizer<'a> {
                     Ok(Some(Token::SingleQuotedString(s)))
                 }
                 // delimited (quoted) identifier
-                quote_start if self.dialect.is_delimited_identifier_start(quote_start) => {
+                quote_start
+                    if self.dialect.is_delimited_identifier_start(ch)
+                        && self
+                            .dialect
+                            .is_proper_identifier_inside_quotes(chars.clone()) =>
+                {
                     chars.next(); // consume the opening quote
                     let quote_end = Word::matching_end_quote(quote_start);
                     let (s, last_char) = parse_quoted_ident(chars, quote_end);
@@ -657,6 +680,10 @@ impl<'a> Tokenizer<'a> {
                     );
                     Ok(Some(Token::Placeholder(String::from("$") + &s)))
                 }
+                //whitespace check (including unicode chars) should be last as it covers some of the chars above
+                ch if ch.is_whitespace() => {
+                    self.consume_and_return(chars, Token::Whitespace(Whitespace::Space))
+                }
                 other => self.consume_and_return(chars, Token::Char(other)),
             },
             None => Ok(None),
@@ -688,6 +715,66 @@ impl<'a> Tokenizer<'a> {
             self.dialect.is_identifier_part(ch)
         }));
         s
+    }
+
+    /// Read a single quoted string, starting with the opening quote.
+    fn tokenize_escaped_single_quoted_string(
+        &self,
+        chars: &mut Peekable<Chars<'_>>,
+    ) -> Result<String, TokenizerError> {
+        let mut s = String::new();
+        chars.next(); // consume the opening quote
+
+        // slash escaping
+        let mut is_escaped = false;
+        while let Some(&ch) = chars.peek() {
+            macro_rules! escape_control_character {
+                ($ESCAPED:expr) => {{
+                    if is_escaped {
+                        s.push($ESCAPED);
+                        is_escaped = false;
+                    } else {
+                        s.push(ch);
+                    }
+
+                    chars.next();
+                }};
+            }
+
+            match ch {
+                '\'' => {
+                    chars.next(); // consume
+                    if is_escaped {
+                        s.push(ch);
+                        is_escaped = false;
+                    } else if chars.peek().map(|c| *c == '\'').unwrap_or(false) {
+                        s.push(ch);
+                        chars.next();
+                    } else {
+                        return Ok(s);
+                    }
+                }
+                '\\' => {
+                    if is_escaped {
+                        s.push('\\');
+                        is_escaped = false;
+                    } else {
+                        is_escaped = true;
+                    }
+
+                    chars.next();
+                }
+                'r' => escape_control_character!('\r'),
+                'n' => escape_control_character!('\n'),
+                't' => escape_control_character!('\t'),
+                _ => {
+                    is_escaped = false;
+                    chars.next(); // consume
+                    s.push(ch);
+                }
+            }
+        }
+        self.tokenizer_error("Unterminated encoded string literal")
     }
 
     /// Read a single quoted string, starting with the opening quote.
@@ -1253,6 +1340,21 @@ mod tests {
         let expected = vec![
             Token::Whitespace(Whitespace::Newline),
             Token::Whitespace(Whitespace::MultiLineComment("* Comment *".to_string())),
+            Token::Whitespace(Whitespace::Newline),
+        ];
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn tokenize_unicode_whitespace() {
+        let sql = String::from(" \u{2003}\n");
+
+        let dialect = GenericDialect {};
+        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokens = tokenizer.tokenize().unwrap();
+        let expected = vec![
+            Token::Whitespace(Whitespace::Space),
+            Token::Whitespace(Whitespace::Space),
             Token::Whitespace(Whitespace::Newline),
         ];
         compare(expected, tokens);

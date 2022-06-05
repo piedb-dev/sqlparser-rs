@@ -154,6 +154,8 @@ pub struct Select {
     pub sort_by: Vec<Expr>,
     /// HAVING
     pub having: Option<Expr>,
+    /// QUALIFY (Snowflake)
+    pub qualify: Option<Expr>,
 }
 
 impl fmt::Display for Select {
@@ -201,6 +203,9 @@ impl fmt::Display for Select {
         }
         if let Some(ref having) = self.having {
             write!(f, " HAVING {}", having)?;
+        }
+        if let Some(ref qualify) = self.qualify {
+            write!(f, " QUALIFY {}", qualify)?;
         }
         Ok(())
     }
@@ -332,7 +337,11 @@ pub enum TableFactor {
         /// Arguments of a table-valued function, as supported by Postgres
         /// and MSSQL. Note that deprecated MSSQL `FROM foo (NOLOCK)` syntax
         /// will also be parsed as `args`.
-        args: Vec<FunctionArg>,
+        ///
+        /// This field's value is `Some(v)`, where `v` is a (possibly empty)
+        /// vector of arguments, in the case of a table-valued function call,
+        /// whereas it's `None` in the case of a regular table name.
+        args: Option<Vec<FunctionArg>>,
         /// MSSQL-specific `WITH (...)` hints such as NOLOCK.
         with_hints: Vec<Expr>,
     },
@@ -345,6 +354,19 @@ pub enum TableFactor {
     TableFunction {
         expr: Expr,
         alias: Option<TableAlias>,
+    },
+    /// SELECT * FROM UNNEST ([10,20,30]) as numbers WITH OFFSET;
+    /// +---------+--------+
+    /// | numbers | offset |
+    /// +---------+--------+
+    /// | 10      | 0      |
+    /// | 20      | 1      |
+    /// | 30      | 2      |
+    /// +---------+--------+
+    UNNEST {
+        alias: Option<TableAlias>,
+        array_expr: Box<Expr>,
+        with_offset: bool,
     },
     /// Represents a parenthesized table factor. The SQL spec only allows a
     /// join expression (`(foo <JOIN> bar [ <JOIN> baz ... ])`) to be nested,
@@ -365,7 +387,7 @@ impl fmt::Display for TableFactor {
                 with_hints,
             } => {
                 write!(f, "{}", name)?;
-                if !args.is_empty() {
+                if let Some(args) = args {
                     write!(f, "({})", display_comma_separated(args))?;
                 }
                 if let Some(alias) = alias {
@@ -394,6 +416,20 @@ impl fmt::Display for TableFactor {
                 write!(f, "TABLE({})", expr)?;
                 if let Some(alias) = alias {
                     write!(f, " AS {}", alias)?;
+                }
+                Ok(())
+            }
+            TableFactor::UNNEST {
+                alias,
+                array_expr,
+                with_offset,
+            } => {
+                write!(f, "UNNEST({})", array_expr)?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {}", alias)?;
+                }
+                if *with_offset {
+                    write!(f, " WITH OFFSET")?;
                 }
                 Ok(())
             }
@@ -649,6 +685,7 @@ impl fmt::Display for Values {
 pub struct SelectInto {
     pub temporary: bool,
     pub unlogged: bool,
+    pub table: bool,
     pub name: ObjectName,
 }
 
@@ -656,7 +693,8 @@ impl fmt::Display for SelectInto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let temporary = if self.temporary { " TEMPORARY" } else { "" };
         let unlogged = if self.unlogged { " UNLOGGED" } else { "" };
+        let table = if self.table { " TABLE" } else { "" };
 
-        write!(f, "INTO{}{} {}", temporary, unlogged, self.name)
+        write!(f, "INTO{}{}{} {}", temporary, unlogged, table, self.name)
     }
 }

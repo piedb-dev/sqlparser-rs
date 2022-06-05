@@ -314,6 +314,41 @@ fn parse_quote_identifiers_2() {
                 distribute_by: vec![],
                 sort_by: vec![],
                 having: None,
+                qualify: None
+            })),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            fetch: None,
+            lock: None,
+        }))
+    );
+}
+
+#[test]
+fn parse_quote_identifiers_3() {
+    let sql = "SELECT ```quoted identifier```";
+    assert_eq!(
+        mysql().verified_stmt(sql),
+        Statement::Query(Box::new(Query {
+            with: None,
+            body: SetExpr::Select(Box::new(Select {
+                distinct: false,
+                top: None,
+                projection: vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident {
+                    value: "`quoted identifier`".into(),
+                    quote_style: Some('`'),
+                }))],
+                into: None,
+                from: vec![],
+                lateral_views: vec![],
+                selection: None,
+                group_by: vec![],
+                cluster_by: vec![],
+                distribute_by: vec![],
+                sort_by: vec![],
+                having: None,
+                qualify: None
             })),
             order_by: vec![],
             limit: None,
@@ -625,7 +660,7 @@ fn parse_update_with_joins() {
                             name: Ident::new("o"),
                             columns: vec![]
                         }),
-                        args: vec![],
+                        args: None,
                         with_hints: vec![],
                     },
                     joins: vec![Join {
@@ -635,7 +670,7 @@ fn parse_update_with_joins() {
                                 name: Ident::new("c"),
                                 columns: vec![]
                             }),
-                            args: vec![],
+                            args: None,
                             with_hints: vec![],
                         },
                         join_operator: JoinOperator::Inner(JoinConstraint::On(Expr::BinaryOp {
@@ -742,7 +777,7 @@ fn parse_substring_in_select() {
                                     quote_style: None
                                 }]),
                                 alias: None,
-                                args: vec![],
+                                args: None,
                                 with_hints: vec![]
                             },
                             joins: vec![]
@@ -754,6 +789,7 @@ fn parse_substring_in_select() {
                         distribute_by: vec![],
                         sort_by: vec![],
                         having: None,
+                        qualify: None
                     })),
                     order_by: vec![],
                     limit: None,
@@ -766,6 +802,36 @@ fn parse_substring_in_select() {
         }
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn parse_kill() {
+    let stmt = mysql_and_generic().verified_stmt("KILL CONNECTION 5");
+    assert_eq!(
+        stmt,
+        Statement::Kill {
+            modifier: Some(KillType::Connection),
+            id: 5,
+        }
+    );
+
+    let stmt = mysql_and_generic().verified_stmt("KILL QUERY 5");
+    assert_eq!(
+        stmt,
+        Statement::Kill {
+            modifier: Some(KillType::Query),
+            id: 5,
+        }
+    );
+
+    let stmt = mysql_and_generic().verified_stmt("KILL 5");
+    assert_eq!(
+        stmt,
+        Statement::Kill {
+            modifier: None,
+            id: 5,
+        }
+    );
 }
 
 fn mysql() -> TestedDialects {

@@ -23,7 +23,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::fmt::{self, Write};
+use core::fmt;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -128,16 +128,8 @@ impl fmt::Display for Ident {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.quote_style {
             Some(q) if q == '"' || q == '\'' || q == '`' => {
-                f.write_char(q)?;
-                let mut first = true;
-                for s in self.value.split_inclusive(q) {
-                    if !first {
-                        f.write_char(q)?;
-                    }
-                    first = false;
-                    f.write_str(s)?;
-                }
-                f.write_char(q)
+                let escaped = value::escape_quoted_string(&self.value, q);
+                write!(f, "{}{}{}", q, escaped, q)
             }
             Some(q) if q == '[' => write!(f, "[{}]", self.value),
             None => f.write_str(&self.value),
@@ -231,6 +223,12 @@ pub enum Expr {
         operator: JsonOperator,
         right: Box<Expr>,
     },
+    /// CompositeAccess (postgres) eg: SELECT (information_schema._pg_expandarray(array['i','i'])).n
+    CompositeAccess { expr: Box<Expr>, key: Ident },
+    /// `IS FALSE` operator
+    IsFalse(Box<Expr>),
+    /// `IS TRUE` operator
+    IsTrue(Box<Expr>),
     /// `IS NULL` operator
     IsNull(Box<Expr>),
     /// `IS NOT NULL` operator
@@ -270,11 +268,12 @@ pub enum Expr {
         op: BinaryOperator,
         right: Box<Expr>,
     },
+    /// Any operation e.g. `1 ANY (1)` or `foo > ANY(bar)`, It will be wrapped in the right side of BinaryExpr
+    AnyOp(Box<Expr>),
+    /// ALL operation e.g. `1 ALL (1)` or `foo > ALL(bar)`, It will be wrapped in the right side of BinaryExpr
+    AllOp(Box<Expr>),
     /// Unary operation e.g. `NOT foo`
-    UnaryOp {
-        op: UnaryOperator,
-        expr: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOperator, expr: Box<Expr> },
     /// CAST an expression to a different data type e.g. `CAST(foo AS VARCHAR(123))`
     Cast {
         expr: Box<Expr>,
@@ -293,10 +292,7 @@ pub enum Expr {
         expr: Box<Expr>,
     },
     /// POSITION(<expr> in <expr>)
-    Position {
-        expr: Box<Expr>,
-        r#in: Box<Expr>,
-    },
+    Position { expr: Box<Expr>, r#in: Box<Expr> },
     /// SUBSTRING(<expr> [FROM <expr>] [FOR <expr>])
     Substring {
         expr: Box<Expr>,
@@ -323,14 +319,12 @@ pub enum Expr {
     /// A constant of form `<data_type> 'value'`.
     /// This can represent ANSI SQL `DATE`, `TIME`, and `TIMESTAMP` literals (such as `DATE '2020-01-01'`),
     /// as well as constants of other types (a non-standard PostgreSQL extension).
-    TypedString {
-        data_type: DataType,
-        value: String,
-    },
-    MapAccess {
-        column: Box<Expr>,
-        keys: Vec<Expr>,
-    },
+    TypedString { data_type: DataType, value: String },
+    /// Access a map-like object by field (e.g. `column['field']` or `column[4]`
+    /// Note that depending on the dialect, struct like accesses may be
+    /// parsed as [`ArrayIndex`] or [`MapAccess`]
+    /// <https://clickhouse.com/docs/en/sql-reference/data-types/map/>
+    MapAccess { column: Box<Expr>, keys: Vec<Expr> },
     /// Scalar function call e.g. `LEFT(foo, 5)`
     Function(Function),
     /// `CASE [<operand>] WHEN <condition> THEN <result> ... [ELSE <result>] END`
@@ -361,10 +355,7 @@ pub enum Expr {
     /// ROW / TUPLE a single value, such as `SELECT (1, 2)`
     Tuple(Vec<Expr>),
     /// An array index expression e.g. `(ARRAY[1, 2])[1]` or `(current_schemas(FALSE))[1]`
-    ArrayIndex {
-        obj: Box<Expr>,
-        indexs: Vec<Expr>,
-    },
+    ArrayIndex { obj: Box<Expr>, indexes: Vec<Expr> },
     /// An array expression e.g. `ARRAY[1, 2]`
     Array(Array),
 }
@@ -385,6 +376,8 @@ impl fmt::Display for Expr {
                 Ok(())
             }
             Expr::CompoundIdentifier(s) => write!(f, "{}", display_separated(s, ".")),
+            Expr::IsTrue(ast) => write!(f, "{} IS TRUE", ast),
+            Expr::IsFalse(ast) => write!(f, "{} IS FALSE", ast),
             Expr::IsNull(ast) => write!(f, "{} IS NULL", ast),
             Expr::IsNotNull(ast) => write!(f, "{} IS NOT NULL", ast),
             Expr::InList {
@@ -434,6 +427,8 @@ impl fmt::Display for Expr {
                 high
             ),
             Expr::BinaryOp { left, op, right } => write!(f, "{} {} {}", left, op, right),
+            Expr::AnyOp(expr) => write!(f, "ANY({})", expr),
+            Expr::AllOp(expr) => write!(f, "ALL({})", expr),
             Expr::UnaryOp { op, expr } => {
                 if op == &UnaryOperator::PGPostfixFactorial {
                     write!(f, "{}{}", expr, op)
@@ -545,9 +540,9 @@ impl fmt::Display for Expr {
             Expr::Tuple(exprs) => {
                 write!(f, "({})", display_comma_separated(exprs))
             }
-            Expr::ArrayIndex { obj, indexs } => {
+            Expr::ArrayIndex { obj, indexes } => {
                 write!(f, "{}", obj)?;
-                for i in indexs {
+                for i in indexes {
                     write!(f, "[{}]", i)?;
                 }
                 Ok(())
@@ -561,6 +556,9 @@ impl fmt::Display for Expr {
                 right,
             } => {
                 write!(f, "{} {} {}", left, operator, right)
+            }
+            Expr::CompositeAccess { expr, key } => {
+                write!(f, "{}.{}", expr, key)
             }
         }
     }
@@ -767,6 +765,8 @@ pub enum Statement {
     Insert {
         /// Only for Sqlite
         or: Option<SqliteOnConflict>,
+        /// INTO - optional keyword
+        into: bool,
         /// TABLE
         table_name: ObjectName,
         /// COLUMNS
@@ -898,6 +898,22 @@ pub enum Statement {
         /// deleted along with the dropped table
         purge: bool,
     },
+    /// FETCH - retrieve rows from a query using a cursor
+    ///
+    /// Note: this is a PostgreSQL-specific statement,
+    /// but may also compatible with other SQL.
+    Fetch {
+        /// Cursor name
+        name: Ident,
+        direction: FetchDirection,
+        /// Optional, It's possible to fetch rows form cursor to the table
+        into: Option<ObjectName>,
+    },
+    /// DISCARD [ ALL | PLANS | SEQUENCES | TEMPORARY | TEMP ]
+    ///
+    /// Note: this is a PostgreSQL-specific statement,
+    /// but may also compatible with other SQL.
+    Discard { object_type: DiscardObject },
     /// SET [ SESSION | LOCAL ] ROLE role_name
     ///
     /// Note: this is a PostgreSQL-specific statement,
@@ -916,7 +932,7 @@ pub enum Statement {
     SetVariable {
         local: bool,
         hivevar: bool,
-        variable: Ident,
+        variable: ObjectName,
         value: Vec<SetVariableValue>,
     },
     /// SHOW <variable>
@@ -980,6 +996,15 @@ pub enum Statement {
         location: Option<String>,
         managed_location: Option<String>,
     },
+    /// CREATE FUNCTION
+    ///
+    /// Hive: https://cwiki.apache.org/confluence/display/hive/languagemanual+ddl#LanguageManualDDL-Create/Drop/ReloadFunction
+    CreateFunction {
+        temporary: bool,
+        name: ObjectName,
+        class_name: String,
+        using: Option<CreateFunctionUsing>,
+    },
     /// `ASSERT <condition> [AS <message>]`
     Assert {
         condition: Expr,
@@ -1017,6 +1042,15 @@ pub enum Statement {
         data_types: Vec<DataType>,
         statement: Box<Statement>,
     },
+    /// KILL [CONNECTION | QUERY | MUTATION]
+    ///
+    /// See <https://clickhouse.com/docs/ru/sql-reference/statements/kill/>
+    /// See <https://dev.mysql.com/doc/refman/8.0/en/kill.html>
+    Kill {
+        modifier: Option<KillType>,
+        // processlist_id
+        id: u64,
+    },
     /// EXPLAIN TABLE
     /// Note: this is a MySQL-specific statement. See <https://dev.mysql.com/doc/refman/8.0/en/explain.html>
     ExplainTable {
@@ -1040,12 +1074,12 @@ pub enum Statement {
     Savepoint { name: Ident },
     // MERGE INTO statement, based on Snowflake. See <https://docs.snowflake.com/en/sql-reference/sql/merge.html>
     Merge {
+        // optional INTO keyword
+        into: bool,
         // Specifies the table to merge
         table: TableFactor,
         // Specifies the table or subquery to join with the target table
-        source: Box<SetExpr>,
-        // Specifies alias to the table that is joined with target table
-        alias: Option<TableAlias>,
+        source: TableFactor,
         // Specifies the expression on which to join the target table and source
         on: Box<Expr>,
         // Specifies the actions to perform when values match or do not match.
@@ -1059,6 +1093,15 @@ impl fmt::Display for Statement {
     #[allow(clippy::cognitive_complexity)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Statement::Kill { modifier, id } => {
+                write!(f, "KILL ")?;
+
+                if let Some(m) = modifier {
+                    write!(f, "{} ", m)?;
+                }
+
+                write!(f, "{}", id)
+            }
             Statement::ExplainTable {
                 describe_alias,
                 table_name,
@@ -1094,6 +1137,21 @@ impl fmt::Display for Statement {
                 write!(f, "{}", statement)
             }
             Statement::Query(s) => write!(f, "{}", s),
+            Statement::Fetch {
+                name,
+                direction,
+                into,
+            } => {
+                write!(f, "FETCH {} ", direction)?;
+
+                write!(f, "IN {}", name)?;
+
+                if let Some(into) = into {
+                    write!(f, " INTO {}", into)?;
+                }
+
+                Ok(())
+            }
             Statement::Directory {
                 overwrite,
                 local,
@@ -1176,6 +1234,7 @@ impl fmt::Display for Statement {
             }
             Statement::Insert {
                 or,
+                into,
                 table_name,
                 overwrite,
                 partitioned,
@@ -1190,9 +1249,10 @@ impl fmt::Display for Statement {
                 } else {
                     write!(
                         f,
-                        "INSERT {act}{tbl} {table_name} ",
+                        "INSERT{over}{int}{tbl} {table_name} ",
                         table_name = table_name,
-                        act = if *overwrite { "OVERWRITE" } else { "INTO" },
+                        over = if *overwrite { " OVERWRITE" } else { "" },
+                        int = if *into { " INTO" } else { "" },
                         tbl = if *table { " TABLE" } else { "" }
                     )?;
                 }
@@ -1296,6 +1356,22 @@ impl fmt::Display for Statement {
                 }
                 if let Some(ml) = managed_location {
                     write!(f, " MANAGEDLOCATION '{}'", ml)?;
+                }
+                Ok(())
+            }
+            Statement::CreateFunction {
+                temporary,
+                name,
+                class_name,
+                using,
+            } => {
+                write!(
+                    f,
+                    "CREATE {temp}FUNCTION {name} AS '{class_name}'",
+                    temp = if *temporary { "TEMPORARY " } else { "" },
+                )?;
+                if let Some(u) = using {
+                    write!(f, " {}", u)?;
                 }
                 Ok(())
             }
@@ -1551,6 +1627,10 @@ impl fmt::Display for Statement {
                 if *cascade { " CASCADE" } else { "" },
                 if *purge { " PURGE" } else { "" }
             ),
+            Statement::Discard { object_type } => {
+                write!(f, "DISCARD {object_type}", object_type = object_type)?;
+                Ok(())
+            }
             Statement::SetRole {
                 local,
                 session,
@@ -1761,16 +1841,17 @@ impl fmt::Display for Statement {
                 write!(f, "{}", name)
             }
             Statement::Merge {
+                into,
                 table,
                 source,
-                alias,
                 on,
                 clauses,
             } => {
-                write!(f, "MERGE INTO {} USING {} ", table, source)?;
-                if let Some(a) = alias {
-                    write!(f, "as {} ", a)?;
-                };
+                write!(
+                    f,
+                    "MERGE{int} {table} USING {source} ",
+                    int = if *into { " INTO" } else { "" }
+                )?;
                 write!(f, "ON {} ", on)?;
                 write!(f, "{}", display_separated(clauses, " "))
             }
@@ -1831,6 +1912,69 @@ impl fmt::Display for Privileges {
                 write!(f, "{}", display_comma_separated(actions))
             }
         }
+    }
+}
+
+/// Specific direction for FETCH statement
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum FetchDirection {
+    Count { limit: Value },
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute { limit: Value },
+    Relative { limit: Value },
+    All,
+    // FORWARD
+    // FORWARD count
+    Forward { limit: Option<Value> },
+    ForwardAll,
+    // BACKWARD
+    // BACKWARD count
+    Backward { limit: Option<Value> },
+    BackwardAll,
+}
+
+impl fmt::Display for FetchDirection {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            FetchDirection::Count { limit } => f.write_str(&limit.to_string())?,
+            FetchDirection::Next => f.write_str("NEXT")?,
+            FetchDirection::Prior => f.write_str("PRIOR")?,
+            FetchDirection::First => f.write_str("FIRST")?,
+            FetchDirection::Last => f.write_str("LAST")?,
+            FetchDirection::Absolute { limit } => {
+                f.write_str("ABSOLUTE ")?;
+                f.write_str(&limit.to_string())?;
+            }
+            FetchDirection::Relative { limit } => {
+                f.write_str("RELATIVE ")?;
+                f.write_str(&limit.to_string())?;
+            }
+            FetchDirection::All => f.write_str("ALL")?,
+            FetchDirection::Forward { limit } => {
+                f.write_str("FORWARD")?;
+
+                if let Some(l) = limit {
+                    f.write_str(" ")?;
+                    f.write_str(&l.to_string())?;
+                }
+            }
+            FetchDirection::ForwardAll => f.write_str("FORWARD ALL")?,
+            FetchDirection::Backward { limit } => {
+                f.write_str("BACKWARD")?;
+
+                if let Some(l) = limit {
+                    f.write_str(" ")?;
+                    f.write_str(&l.to_string())?;
+                }
+            }
+            FetchDirection::BackwardAll => f.write_str("BACKWARD ALL")?,
+        };
+
+        Ok(())
     }
 }
 
@@ -2123,6 +2267,26 @@ impl fmt::Display for ObjectType {
             ObjectType::View => "VIEW",
             ObjectType::Index => "INDEX",
             ObjectType::Schema => "SCHEMA",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum KillType {
+    Connection,
+    Query,
+    Mutation,
+}
+
+impl fmt::Display for KillType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            // MySQL
+            KillType::Connection => "CONNECTION",
+            KillType::Query => "QUERY",
+            // Clickhouse supports Mutation
+            KillType::Mutation => "MUTATION",
         })
     }
 }
@@ -2458,7 +2622,7 @@ impl fmt::Display for CopyLegacyCsvOption {
     }
 }
 
-///  
+///
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum MergeClause {
@@ -2516,6 +2680,45 @@ impl fmt::Display for MergeClause {
                     values
                 )
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum DiscardObject {
+    ALL,
+    PLANS,
+    SEQUENCES,
+    TEMP,
+}
+
+impl fmt::Display for DiscardObject {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DiscardObject::ALL => f.write_str("ALL"),
+            DiscardObject::PLANS => f.write_str("PLANS"),
+            DiscardObject::SEQUENCES => f.write_str("SEQUENCES"),
+            DiscardObject::TEMP => f.write_str("TEMP"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CreateFunctionUsing {
+    Jar(String),
+    File(String),
+    Archive(String),
+}
+
+impl fmt::Display for CreateFunctionUsing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "USING ")?;
+        match self {
+            CreateFunctionUsing::Jar(uri) => write!(f, "JAR '{uri}'"),
+            CreateFunctionUsing::File(uri) => write!(f, "FILE '{uri}'"),
+            CreateFunctionUsing::Archive(uri) => write!(f, "ARCHIVE '{uri}'"),
         }
     }
 }

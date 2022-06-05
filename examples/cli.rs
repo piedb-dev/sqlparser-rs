@@ -38,11 +38,13 @@ $ cargo run --feature json_example --example cli FILENAME.sql [--dialectname]
 
     let dialect: Box<dyn Dialect> = match std::env::args().nth(2).unwrap_or_default().as_ref() {
         "--ansi" => Box::new(AnsiDialect {}),
+        "--bigquery" => Box::new(BigQueryDialect {}),
         "--postgres" => Box::new(PostgreSqlDialect {}),
         "--ms" => Box::new(MsSqlDialect {}),
         "--mysql" => Box::new(MySqlDialect {}),
         "--snowflake" => Box::new(SnowflakeDialect {}),
         "--hive" => Box::new(HiveDialect {}),
+        "--redshift" => Box::new(RedshiftSqlDialect {}),
         "--generic" | "" => Box::new(GenericDialect {}),
         s => panic!("Unexpected parameter: {}", s),
     };
